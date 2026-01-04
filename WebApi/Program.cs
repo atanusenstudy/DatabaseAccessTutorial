@@ -1,37 +1,22 @@
 using Core.Interfaces;
 using DAL.DataContext;
-using DAL.Repositories.AdoNet;
+using DAL.Utilities;
 using Microsoft.AspNetCore.Diagnostics;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.EntityFrameworkCore.Migrations;
-using Microsoft.Extensions.Configuration;
 using System.Net;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Add services to the container.
+// Test connections immediately
+Console.Clear();
+Console.WriteLine("=== Application Starting ===");
+ConnectionTester.TestAllConnections(builder.Configuration);
 
+// Add services to the container
 builder.Services.AddControllers();
-// Learn more about configuring Swagger/OpenAPI at https://aka.ms/aspnetcore/swashbuckle
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
-// WebApi/Program.cs
-
-// Configuration for multiple database connections in appsettings.json
-/*
-"ConnectionStrings": {
-  "EF_Core_TutorialDB_Connection": "Server=.;Database=TutorialDB;Trusted_Connection=True;TrustServerCertificate=True;",
-  "Dapper_TutorialDB_Connection": "Server=.;Database=TutorialDB;Trusted_Connection=True;TrustServerCertificate=True;",
-  "AdoNet_TutorialDB_Connection": "Server=.;Database=TutorialDB;Trusted_Connection=True;TrustServerCertificate=True;"
-}
-*/
-
-
-/* In Package Manager Console with DAL as default project
-    Add - Migration InitialCreate - Context EntityFrameworkDbContext
-    Update-Database -Context EntityFrameworkDbContext
-*/
 #region Database Contexts
 // Entity Framework
 builder.Services.AddDbContext<EntityFrameworkDbContext>(options =>
@@ -39,8 +24,6 @@ builder.Services.AddDbContext<EntityFrameworkDbContext>(options =>
         builder.Configuration.GetConnectionString("DefaultConnection"),
         sqlServerOptions => sqlServerOptions.MigrationsAssembly("DAL")
     ));
-//builder.Services.AddDbContext<EntityFrameworkDbContext>(options =>
-//    options.UseSqlServer(builder.Configuration.GetConnectionString("EF_Core_TutorialDB_Connection")));
 
 // Dapper
 builder.Services.AddSingleton<DapperContext>();
@@ -50,31 +33,14 @@ builder.Services.AddSingleton<AdoNetContext>();
 #endregion
 
 #region Repository Registration
-// Choose ONE implementation based on your preference or configuration
-// Option 1: Entity Framework
-// builder.Services.AddScoped<IEmployeeRepository, DAL.Repositories.EntityFramework.EmployeeRepository>();
-// builder.Services.AddScoped<IProjectRepository, DAL.Repositories.EntityFramework.ProjectRepository>();
-// builder.Services.AddScoped<ITicketRepository, DAL.Repositories.EntityFramework.TicketRepository>();
-
-// Option 2: Dapper
-// builder.Services.AddScoped<IEmployeeRepository, DAL.Repositories.Dapper.EmployeeRepository>();
-// builder.Services.AddScoped<IProjectRepository, DAL.Repositories.Dapper.ProjectRepository>();
-// builder.Services.AddScoped<ITicketRepository, DAL.Repositories.Dapper.TicketRepository>();
-
-// Option 3: ADO.NET
-// builder.Services.AddScoped<IEmployeeRepository, DAL.Repositories.AdoNet.EmployeeRepository>();
-// builder.Services.AddScoped<IProjectRepository, DAL.Repositories.AdoNet.ProjectRepository>();
-// builder.Services.AddScoped<ITicketRepository, DAL.Repositories.AdoNet.TicketRepository>();
-
-// OR: Use a factory pattern to switch between implementations
-var dataAccessTechnology = builder.Configuration["DataAccess:Type"] ?? "EntityFramework";
+var dataAccessTechnology = builder.Configuration["DataAccess:Technology"] ?? "EntityFramework";
 
 switch (dataAccessTechnology.ToLower())
 {
     case "dapper":
-        builder.Services.AddScoped<IEmployeeRepository, EmployeeRepository>();
-        builder.Services.AddScoped<IProjectRepository, ProjectRepository>();
-        builder.Services.AddScoped<ITicketRepository, TicketRepository>();
+        builder.Services.AddScoped<IEmployeeRepository, DAL.Repositories.Dapper.EmployeeRepository>();
+        builder.Services.AddScoped<IProjectRepository, DAL.Repositories.Dapper.ProjectRepository>();
+        builder.Services.AddScoped<ITicketRepository, DAL.Repositories.Dapper.TicketRepository>();
         break;
 
     case "ado.net":
@@ -91,22 +57,40 @@ switch (dataAccessTechnology.ToLower())
         builder.Services.AddScoped<ITicketRepository, DAL.Repositories.EntityFramework.TicketRepository>();
         break;
 }
+#endregion
 
+#region Health Check Services Registration (FIXED)
+// Add this BEFORE the builder.Build() call
+builder.Services.AddScoped<IHealthCheckService, Infrastructure.Health.HealthCheckService>();
+
+// Register individual health checkers
+builder.Services.AddScoped<Infrastructure.Health.IHealthChecker,
+    Infrastructure.Health.HealthCheckers.EntityFrameworkHealthChecker>();
+builder.Services.AddScoped<Infrastructure.Health.IHealthChecker,
+    Infrastructure.Health.HealthCheckers.DapperHealthChecker>();
+builder.Services.AddScoped<Infrastructure.Health.IHealthChecker,
+    Infrastructure.Health.HealthCheckers.AdoNetHealthChecker>();
+
+// Collect all health checkers
+builder.Services.AddScoped<System.Collections.Generic.IEnumerable<Infrastructure.Health.IHealthChecker>>(provider =>
+{
+    var checkers = provider.GetServices<Infrastructure.Health.IHealthChecker>();
+    return checkers;
+});
 #endregion
 
 #region CORS Configuration
 builder.Services.AddCors(options =>
 {
     options.AddPolicy("AllowAll",
-        builder =>
+        policy =>
         {
-            builder.AllowAnyOrigin()
+            policy.AllowAnyOrigin()
                    .AllowAnyMethod()
                    .AllowAnyHeader();
         });
 });
 #endregion
-
 
 var app = builder.Build();
 
@@ -121,15 +105,30 @@ app.UseExceptionHandler(errorApp =>
         var exceptionHandlerPathFeature = context.Features.Get<IExceptionHandlerPathFeature>();
         var exception = exceptionHandlerPathFeature?.Error;
 
-        await context.Response.WriteAsync(new
+        await context.Response.WriteAsJsonAsync(new
         {
             StatusCode = context.Response.StatusCode,
             Message = "An internal server error occurred.",
             Detail = exception?.Message
-        }.ToString());
+        });
     });
 });
 
+// Add health check endpoints
+app.MapHealthChecks("/health/ready");
+app.MapHealthChecks("/health/live");
+
+// Add minimal API endpoint for quick health check
+app.MapGet("/health/minimal", async (IHealthCheckService healthService) =>
+{
+    var isConnected = await healthService.IsDatabaseConnectedAsync();
+    return Results.Json(new
+    {
+        status = isConnected ? "healthy" : "unhealthy",
+        database = isConnected ? "connected" : "disconnected",
+        timestamp = DateTime.UtcNow
+    });
+});
 
 // Configure the HTTP request pipeline.
 if (app.Environment.IsDevelopment())
@@ -139,9 +138,8 @@ if (app.Environment.IsDevelopment())
 }
 
 app.UseHttpsRedirection();
-
+app.UseCors("AllowAll");
 app.UseAuthorization();
-
 app.MapControllers();
 
 app.Run();
